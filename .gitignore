@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+sv_*.jpg
+sv_*.png
+_docs_preview.html
+# never commit auth/session material
+*.auth.json
+.pw-auth/
+*storage-state*.json
+*cookies*.json

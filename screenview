@@ -1,0 +1,357 @@
+#!/usr/bin/env python3
+"""screenview - token-efficient screen inspection & control for AI agents.
+
+Cheapest-first philosophy: prefer structured text over pixels.
+  apps    list accessibility-exposed applications        (text, ~free)
+  windows list X11 windows with geometry                 (text, ~free)
+  tree    dump an app's accessibility tree as text       (text, cheap)
+  read    OCR a window/region to plain text              (text, cheap)
+  shot    capture a downscaled JPG, print its path       (image, moderate)
+  click / type / key   drive the GUI via xdotool         (control)
+  look    smart read: try a11y tree, fall back to OCR    (auto)
+"""
+import argparse
+import os
+import shlex
+import subprocess
+import sys
+import tempfile
+
+DISPLAY = os.environ.get("DISPLAY", ":0.0")
+ENV = {**os.environ, "DISPLAY": DISPLAY}
+
+
+def run(cmd, **kw):
+    return subprocess.run(cmd, env=ENV, capture_output=True, text=True, **kw)
+
+
+# ---------------------------------------------------------------- X11 windows
+def cmd_windows(args):
+    out = run(["xdotool", "search", "--onlyvisible", "--name", ""]).stdout.split()
+    rows = []
+    for wid in out:
+        name = run(["xdotool", "getwindowname", wid]).stdout.strip()
+        if not name:
+            continue
+        geo = run(["xdotool", "getwindowgeometry", "--shell", wid]).stdout
+        g = dict(
+            line.split("=", 1) for line in geo.strip().splitlines() if "=" in line
+        )
+        rows.append((wid, g.get("WIDTH", "?"), g.get("HEIGHT", "?"),
+                     g.get("X", "?"), g.get("Y", "?"), name))
+    if not rows:
+        print("(no visible named windows)")
+        return
+    for wid, w, h, x, y, name in rows:
+        print(f"[{wid}] {w}x{h}+{x}+{y}  {name}")
+
+
+# ---------------------------------------------------------------- AT-SPI tree
+def _atspi():
+    import pyatspi
+    return pyatspi
+
+
+def cmd_apps(args):
+    pyatspi = _atspi()
+    desktop = pyatspi.Registry.getDesktop(0)
+    for app in desktop:
+        try:
+            n = app.name
+        except Exception:
+            continue
+        if n:
+            print(f"{app.getChildCount():>3} children  {n}")
+
+
+def _node_line(node, depth):
+    pyatspi = _atspi()
+    role = node.getRoleName()
+    name = (node.name or "").strip()
+    text = ""
+    try:
+        ti = node.queryText()
+        text = (ti.getText(0, ti.characterCount) or "").strip()
+    except Exception:
+        pass
+    label = name or text
+    label = (label[:80] + "…") if len(label) > 80 else label
+    states = node.getState()
+    flags = []
+    if states.contains(pyatspi.STATE_FOCUSED):
+        flags.append("focused")
+    if states.contains(pyatspi.STATE_SELECTED):
+        flags.append("selected")
+    fl = f" ({','.join(flags)})" if flags else ""
+    return f"{'  ' * depth}{role}: {label}{fl}" if label else f"{'  ' * depth}{role}{fl}"
+
+
+def _walk(node, depth, maxdepth, lines):
+    if depth > maxdepth:
+        return
+    try:
+        lines.append(_node_line(node, depth))
+    except Exception:
+        return
+    for child in node:
+        if child is not None:
+            _walk(child, depth + 1, maxdepth, lines)
+
+
+def _find_app(desktop, name):
+    name_l = name.lower()
+    for app in desktop:
+        try:
+            if app.name and name_l in app.name.lower():
+                return app
+        except Exception:
+            continue
+    return None
+
+
+def _find_active(desktop):
+    pyatspi = _atspi()
+    for app in desktop:
+        for frame in app:
+            try:
+                if frame.getState().contains(pyatspi.STATE_ACTIVE):
+                    return frame
+            except Exception:
+                continue
+    return None
+
+
+def cmd_tree(args):
+    pyatspi = _atspi()
+    desktop = pyatspi.Registry.getDesktop(0)
+    if args.active:
+        root = _find_active(desktop)
+        if root is None:
+            print("(no active frame found via AT-SPI)")
+            return
+    elif args.app:
+        root = _find_app(desktop, args.app)
+        if root is None:
+            print(f"(no accessible app matching '{args.app}')")
+            return
+    else:
+        print("specify --app NAME or --active", file=sys.stderr)
+        sys.exit(2)
+    lines = []
+    _walk(root, 0, args.depth, lines)
+    print("\n".join(lines) if lines else "(empty tree)")
+
+
+# ---------------------------------------------------------------- capture
+def _capture(args, suffix):
+    fd, path = tempfile.mkstemp(suffix=suffix, prefix="sv_")
+    os.close(fd)
+    if args.region:
+        x, y, w, h = args.region.split(",")
+        run(["import", "-window", "root", "-crop", f"{w}x{h}+{x}+{y}", "+repage", path])
+    elif args.window:
+        run(["import", "-window", args.window, path])
+    elif getattr(args, "active", False):
+        wid = run(["xdotool", "getactivewindow"]).stdout.strip()
+        run(["import", "-window", wid, path])
+    else:
+        run(["import", "-window", "root", path])
+    return path
+
+
+# ---------------------------------------------------------------- OCR read
+def cmd_read(args):
+    png = _capture(args, ".png")
+    res = run(["tesseract", png, "stdout"])
+    os.unlink(png)
+    text = "\n".join(l for l in res.stdout.splitlines() if l.strip())
+    print(text if text.strip() else "(no text recognized)")
+
+
+# ---------------------------------------------------------------- downscaled shot
+def cmd_shot(args):
+    raw = _capture(args, ".png")
+    out = args.out or os.path.expanduser(
+        f"~/Screenshots/sv_{os.path.basename(raw).replace('.png','')}.jpg")
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    run(["convert", raw, "-resize", f"{args.scale}x", "-quality", str(args.quality), out])
+    os.unlink(raw)
+    print(out)
+
+
+# ---------------------------------------------------------------- control
+def cmd_click(args):
+    run(["xdotool", "mousemove", str(args.x), str(args.y), "click", "1"])
+    print(f"clicked {args.x},{args.y}")
+
+
+def cmd_type(args):
+    run(["xdotool", "type", "--clearmodifiers", args.text])
+    print(f"typed {len(args.text)} chars")
+
+
+def cmd_key(args):
+    run(["xdotool", "key", args.keys])
+    print(f"sent key {args.keys}")
+
+
+# ---------------------------------------------------------------- smart look
+def cmd_look(args):
+    pyatspi = _atspi()
+    desktop = pyatspi.Registry.getDesktop(0)
+    root = _find_active(desktop)
+    if root is not None:
+        lines = []
+        _walk(root, 0, args.depth, lines)
+        if lines and len([l for l in lines if l.strip()]) > 1:
+            print("# source: accessibility tree (active window)")
+            print("\n".join(lines))
+            return
+    print("# source: OCR fallback (no usable a11y tree)")
+    ns = argparse.Namespace(region=None, window=None, active=True)
+    cmd_read(ns)
+
+
+# ---------------------------------------------------------------- web (playwright-cli)
+# Token-efficient browser: a page snapshot is ~100-400 tokens of structured
+# refs (heading/link/button [ref=eN]) you act on by ref — no pixel coords,
+# no screenshots. Wraps the `playwright-cli` binary. Default browser: firefox.
+PW = "playwright-cli"
+
+
+def _pw(*args):
+    return subprocess.run([PW, *args], env=ENV, capture_output=True, text=True)
+
+
+def cmd_web_auth(args):
+    """Reuse an existing logged-in session: extract a domain's cookies from the
+    user's Firefox profile into a Playwright storage-state json. Avoids fresh
+    login entirely (so no Google 'browser not secure' block). Output holds
+    session cookies = sensitive; written 0600 under ~/.pw-auth (gitignored)."""
+    import sqlite3, glob, shutil, tempfile, json
+    cands = ([args.profile] if args.profile else
+             sorted(glob.glob(os.path.expanduser("~/.mozilla/firefox/*/cookies.sqlite"))))
+    src = next((c for c in cands if os.path.exists(c)), None)
+    if not src:
+        print("no firefox cookies.sqlite found", file=sys.stderr); sys.exit(1)
+    tmp = tempfile.mktemp(suffix=".sqlite")
+    shutil.copy(src, tmp)
+    for ext in ("-wal", "-shm"):
+        if os.path.exists(src + ext):
+            shutil.copy(src + ext, tmp + ext)
+    con = sqlite3.connect(f"file:{tmp}?immutable=1", uri=True)
+    rows = con.execute(
+        "SELECT host,name,value,path,expiry,isSecure,isHttpOnly,sameSite "
+        "FROM moz_cookies WHERE host LIKE ?", (f"%{args.domain}%",)).fetchall()
+    con.close()
+    for f in (tmp, tmp + "-wal", tmp + "-shm"):
+        if os.path.exists(f):
+            os.unlink(f)
+    ss = {0: "Lax", 1: "Lax", 2: "Strict"}
+    cookies = [{"name": n, "value": v, "domain": h, "path": p or "/",
+                "expires": float(e) if e else -1,
+                "httpOnly": bool(ho), "secure": bool(sec),
+                "sameSite": ss.get(samesite, "Lax")}
+               for h, n, v, p, e, sec, ho, samesite in rows]
+    out = args.out or os.path.expanduser(f"~/.pw-auth/{args.domain}.json")
+    d = os.path.dirname(out)
+    os.makedirs(d, exist_ok=True); os.chmod(d, 0o700)
+    with open(out, "w") as fh:
+        json.dump({"cookies": cookies, "origins": []}, fh)
+    os.chmod(out, 0o600)
+    print(out)
+    print(f"# extracted {len(cookies)} cookies for {args.domain}", file=sys.stderr)
+
+
+def cmd_browse(args):
+    """Open/navigate to a url and print the compact snapshot in one step."""
+    if getattr(args, "storage_state", None):
+        _pw("close")
+        _pw("open", "--browser", args.browser, args.url)
+        _pw("state-load", args.storage_state)
+        _pw("goto", args.url)
+    else:
+        r = _pw("goto", args.url)
+        if r.returncode != 0 or "not open" in (r.stdout + r.stderr).lower():
+            _pw("open", "--browser", args.browser, args.url)
+    if args.wait:
+        import time
+        time.sleep(args.wait)
+    print(_pw("snapshot").stdout)
+
+
+def cmd_web(args):
+    """Passthrough to playwright-cli: web <cmd> [args...] (click/type/fill/...)."""
+    r = _pw(*args.args)
+    out = (r.stdout or "") + (r.stderr or "")
+    print(out.rstrip())
+
+
+# ---------------------------------------------------------------- argparse
+def main():
+    p = argparse.ArgumentParser(prog="screenview", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("windows", help="list X11 windows").set_defaults(fn=cmd_windows)
+    sub.add_parser("apps", help="list accessible apps").set_defaults(fn=cmd_apps)
+
+    t = sub.add_parser("tree", help="dump AT-SPI tree as text")
+    t.add_argument("--app", help="match application by name")
+    t.add_argument("--active", action="store_true", help="use the active window")
+    t.add_argument("--depth", type=int, default=12)
+    t.set_defaults(fn=cmd_tree)
+
+    for name, fn, helptxt in [("read", cmd_read, "OCR to text"),
+                              ("shot", cmd_shot, "downscaled JPG")]:
+        s = sub.add_parser(name, help=helptxt)
+        s.add_argument("--window", help="X11 window id")
+        s.add_argument("--active", action="store_true", help="active window")
+        s.add_argument("--region", help="X,Y,W,H")
+        if name == "shot":
+            s.add_argument("--scale", type=int, default=1000, help="target width px")
+            s.add_argument("--quality", type=int, default=70)
+            s.add_argument("--out", help="output path")
+        s.set_defaults(fn=fn)
+
+    c = sub.add_parser("click", help="mouse click at x y")
+    c.add_argument("x", type=int); c.add_argument("y", type=int)
+    c.set_defaults(fn=cmd_click)
+
+    ty = sub.add_parser("type", help="type text")
+    ty.add_argument("text"); ty.set_defaults(fn=cmd_type)
+
+    k = sub.add_parser("key", help="send key combo e.g. ctrl+s")
+    k.add_argument("keys"); k.set_defaults(fn=cmd_key)
+
+    lk = sub.add_parser("look", help="smart: a11y tree else OCR")
+    lk.add_argument("--depth", type=int, default=12)
+    lk.set_defaults(fn=cmd_look)
+
+    br = sub.add_parser("browse", help="open/goto a url + print compact snapshot")
+    br.add_argument("url")
+    br.add_argument("--browser", default="firefox",
+                    help="chrome|firefox|webkit|msedge (default firefox)")
+    br.add_argument("--wait", type=float, default=0,
+                    help="seconds to wait after load before snapshot (for SPAs)")
+    br.add_argument("--storage-state",
+                    help="playwright storage-state json (reuse a logged-in session)")
+    br.set_defaults(fn=cmd_browse)
+
+    wa = sub.add_parser("web-auth",
+                        help="extract a domain's login cookies from Firefox -> storage-state json")
+    wa.add_argument("domain")
+    wa.add_argument("--profile", help="path to a specific cookies.sqlite")
+    wa.add_argument("--out", help="output json path (default ~/.pw-auth/<domain>.json)")
+    wa.set_defaults(fn=cmd_web_auth)
+
+    wb = sub.add_parser("web", help="passthrough to playwright-cli (click/type/fill/snapshot/close)")
+    wb.add_argument("args", nargs=argparse.REMAINDER)
+    wb.set_defaults(fn=cmd_web)
+
+    args = p.parse_args()
+    args.fn(args)
+
+
+if __name__ == "__main__":
+    main()
