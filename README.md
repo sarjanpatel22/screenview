@@ -27,6 +27,12 @@ picks the lightest method that actually answers the question.
 - 🎮 **Full GUI control** — mouse, keyboard, window targeting via `xdotool`.
 - 📉 **Measured 60–99% token savings** on real web/text tasks (see [Performance](#performance--benchmarks)).
 
+### Demo
+
+![screenview browsing a page and clicking by ref](docs/img/demo.png)
+
+*A whole page becomes ~100 tokens of element refs, and you act on it by `ref` — no screenshots, no pixel coordinates.*
+
 ### Table of contents
 
 - [Philosophy](#philosophy-cheapest-method-that-answers-the-task)
